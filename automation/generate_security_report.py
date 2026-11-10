@@ -6,6 +6,7 @@ severity summary is intern work.
 
 from __future__ import annotations
 
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,14 @@ PROTECTED_RESOURCE = "incident reports and vulnerability reports"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REPORTS_DIR = REPO_ROOT / "reports"
 CONSOLE = Console()
+SCANNER_PREFIXES = {
+    "bandit": "Bandit",
+    "pip-audit": "pip-audit",
+    "detect-secrets": "detect-secrets",
+}
+BANDIT_SEVERITIES = ("High", "Medium", "Low")
+PIP_AUDIT_FINDING = r"^\S+ \S+: \S+ \(fixed in:"
+SECRET_FINDING = r"^.+:\d+ \S.*$"
 
 
 def build_report_path(generated_at: datetime) -> Path:
@@ -26,7 +35,7 @@ def build_report_path(generated_at: datetime) -> Path:
 
 
 def collect_scanner_reports(reports_dir: Path) -> list[Path]:
-    """Return scanner Markdown files, newest first.
+    """Return scanner reports (.md or .txt), newest first.
 
     The security report this command is about to write is not an input.
     """
@@ -34,28 +43,77 @@ def collect_scanner_reports(reports_dir: Path) -> list[Path]:
         return []
     reports = [
         path
-        for path in reports_dir.glob("*.md")
-        if not path.name.startswith("security-report-")
+        for path in reports_dir.iterdir()
+        if path.suffix in {".md", ".txt"}
+        and not path.name.startswith("security-report-")
     ]
     return sorted(reports, key=lambda path: path.stat().st_mtime, reverse=True)
 
 
 def summarise_findings(report_paths: list[Path]) -> str:
-    """Describe findings from scanner output.
+    """Summarise the newest report from each scanner as a Markdown table.
 
-    Interns: implement this part.
-    Read each report and group results by severity. Never copy tokens,
-    passwords, or other secrets into the summary.
+    Only counts are reported. Secret values are never copied.
     """
     if not report_paths:
         return "_No scanner reports found. Run a scanner, then generate this report again._"
 
-    lines = [
-        "Scanner reports found. Interns: replace this list with a severity summary.",
-        "",
+    rows = [
+        "| Scanner | Report | Findings | High / Medium / Low |",
+        "|---|---|---|---|",
     ]
-    lines.extend(f"- `{path.name}`" for path in report_paths)
-    return "\n".join(lines)
+    for prefix, label in SCANNER_PREFIXES.items():
+        path = latest_report_for(prefix, report_paths)
+        if path is None:
+            rows.append(f"| {label} | _not run_ | - | - |")
+            continue
+        try:
+            if prefix == "bandit":
+                counts = count_bandit_severities(path)
+                total = sum(counts.values())
+                breakdown = " / ".join(str(counts[name]) for name in BANDIT_SEVERITIES)
+            elif prefix == "pip-audit":
+                total = count_matching_lines(path, PIP_AUDIT_FINDING)
+                breakdown = "not graded by pip-audit"
+            else:
+                total = count_matching_lines(path, SECRET_FINDING)
+                breakdown = "not graded"
+        except (OSError, ValueError) as exc:
+            rows.append(f"| {label} | `{path.name}` | could not read ({exc}) | - |")
+            continue
+        rows.append(f"| {label} | `{path.name}` | {total} | {breakdown} |")
+
+    rows.extend(["", "Details stay in the scanner reports. Counts only, no secret values."])
+    return "\n".join(rows)
+
+
+def latest_report_for(prefix: str, report_paths: list[Path]) -> Path | None:
+    """Return the newest report whose name starts with the scanner prefix."""
+    for path in report_paths:
+        if path.name.startswith(f"{prefix}-"):
+            return path
+    return None
+
+def count_bandit_severities(path: Path) -> dict[str, int]:
+    """Return Bandit issue counts by severity from one report."""
+    text = path.read_text(encoding="utf-8")
+    block = re.search(
+        r"Total issues \(by severity\):(.*?)Total issues \(by confidence\)",
+        text,
+        re.DOTALL,
+    )
+    if block is None:
+        raise ValueError("no severity totals; re-run scanners/bandit_runner.py")
+    counts = {name: 0 for name in BANDIT_SEVERITIES}
+    for name, number in re.findall(r"(High|Medium|Low):\s*(\d+)", block.group(1)):
+        counts[name] = int(number)
+    return counts
+
+def count_matching_lines(path: Path, pattern: str) -> int:
+    """Count lines in a report that match a finding pattern."""
+    text = path.read_text(encoding="utf-8")
+    return len(re.findall(pattern, text, re.MULTILINE))
+
 
 
 def render_report(generated_at: datetime, findings: str) -> str:
